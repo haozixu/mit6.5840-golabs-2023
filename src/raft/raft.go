@@ -18,7 +18,7 @@ package raft
 //
 
 import (
-	//	"bytes"
+	"bytes"
 	"context"
 	"fmt"
 	"math/rand"
@@ -26,7 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -141,12 +141,17 @@ func (rf *Raft) updateHeartbeat() {
 }
 
 // no lock operations
-func (rf *Raft) enterNewTerm(newTerm int, role serverRole) {
+func (rf *Raft) enterNewTerm(newTerm int, votedFor int, role serverRole) {
 	rf.dbg(dTerm, "enter new term %d as %s", newTerm, role.String())
 	rf.currentTerm = newTerm
-	rf.votedFor = -1 // not yet voted in this new term
+	rf.votedFor = votedFor
+	rf.persist()
 
 	rf.setRole(role)
+}
+
+func (rf *Raft) enterNewTermAsFollower(newTerm int) {
+	rf.enterNewTerm(newTerm, -1, rFollower)
 }
 
 // NOTE: no lock operations
@@ -204,6 +209,12 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	buf := new(bytes.Buffer)
+	e := labgob.NewEncoder(buf)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	rf.persister.Save(buf.Bytes(), nil)
 }
 
 // restore previously persisted state.
@@ -224,6 +235,22 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	d := labgob.NewDecoder(bytes.NewBuffer(data))
+	var curTerm int
+	var votedFor int
+	var logs []LogEntry
+	if d.Decode(&curTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil {
+		panic("bad persisted state")
+	} else {
+		rf.currentTerm = curTerm
+		rf.votedFor = votedFor
+		rf.logs = logs
+
+		// override current role
+		rf.setRole(rFollower)
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -271,7 +298,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// update currentTerm if term of the incoming request is larger, and become a follower
 	if rf.currentTerm < args.Term {
-		rf.enterNewTerm(args.Term, rFollower)
+		rf.enterNewTermAsFollower(args.Term)
 	}
 
 	voteGranted := false
@@ -288,7 +315,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 
 		if candidateLogUpToDate {
-			rf.votedFor = args.CandidateId
+			if rf.votedFor == -1 {
+				rf.votedFor = args.CandidateId
+				rf.persist()
+			}
 			voteGranted = true
 
 			// "If election timeout elapses without receiving
@@ -331,7 +361,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// update currentTerm if term of the incoming request is larger, and become a follower
 	if rf.currentTerm < args.Term {
-		rf.enterNewTerm(args.Term, rFollower)
+		rf.enterNewTermAsFollower(args.Term)
 	}
 	reply.Term = rf.currentTerm
 
@@ -366,6 +396,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	newEntries := args.Entries[recvLogIndex:]
 	rf.logs = append(rf.logs, newEntries...)
+	if hasConflict || len(newEntries) > 0 {
+		rf.persist()
+	}
 
 	// stupid min/max. go 1.21 provides them
 	min := func(a int, b int) int {
@@ -376,7 +409,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if rf.commitIndex < args.LeaderCommit {
-		rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+len(newEntries))
+		rf.commitIndex = min(args.LeaderCommit, len(rf.logs)-1)
 		rf.commitNewLogs()
 	}
 	reply.Success = true
@@ -456,6 +489,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// append entry to local logs
 	rf.logs = append(rf.logs, LogEntry{command, term})
+	rf.persist()
 	go rf.replicateLogs()
 
 	return index, term, isLeader
@@ -474,12 +508,8 @@ func (rf *Raft) broadcastAppendEntries(isHeartbeat bool) {
 	respCh := make(chan Bundle)
 
 	// requires to be invoked when lock is obtained
-	makeRpcBundle := func(peer int, nextIndex int, isHeartbeat bool) Bundle {
+	makeRpcBundle := func(peer int, nextIndex int) Bundle {
 		prevLogIndex := nextIndex - 1
-		entries := []LogEntry{}
-		if !isHeartbeat {
-			entries = rf.logs[nextIndex:]
-		}
 
 		args := AppendEntriesArgs{
 			Term:         rf.currentTerm,
@@ -487,7 +517,7 @@ func (rf *Raft) broadcastAppendEntries(isHeartbeat bool) {
 			LeaderCommit: rf.commitIndex,
 			PrevLogIndex: prevLogIndex,
 			PrevLogTerm:  rf.logs[prevLogIndex].Term,
-			Entries:      entries,
+			Entries:      rf.logs[nextIndex:],
 		}
 		reply := AppendEntriesReply{}
 		return Bundle{peer, &args, &reply}
@@ -514,7 +544,7 @@ func (rf *Raft) broadcastAppendEntries(isHeartbeat bool) {
 		}
 
 		nTargets++
-		b := makeRpcBundle(i, rf.nextIndex[i], isHeartbeat)
+		b := makeRpcBundle(i, rf.nextIndex[i])
 		go doRpc(b)
 	}
 	rf.mu.Unlock() // leave critical section
@@ -534,12 +564,14 @@ recvLoop:
 
 			rf.mu.Lock() // enter critical section
 			if b.args.Term < rf.currentTerm {
-				panic("outdated RPC")
+				// NOTE: this CAN happen. ignore the reply
+				rf.mu.Unlock() // leave critical section
+				continue recvLoop
 			}
 
 			if rf.currentTerm < b.reply.Term {
 				// step down immediately
-				rf.enterNewTerm(b.reply.Term, rFollower)
+				rf.enterNewTermAsFollower(b.reply.Term)
 				rf.mu.Unlock() // leave critical section
 				return
 			}
@@ -554,7 +586,7 @@ recvLoop:
 				}
 				rf.nextIndex[i] = prevIndex + 1
 
-				b := makeRpcBundle(i, rf.nextIndex[i], isHeartbeat)
+				b := makeRpcBundle(i, rf.nextIndex[i])
 				go doRpc(b)
 				rf.mu.Unlock() // leave critical section
 				continue recvLoop
@@ -637,8 +669,7 @@ func (rf *Raft) startElection() bool {
 
 	rf.mu.Lock() // enter critical section
 	// turns into a candidate
-	rf.enterNewTerm(rf.currentTerm+1, rCandidate)
-	rf.votedFor = rf.me
+	rf.enterNewTerm(rf.currentTerm+1, rf.me, rCandidate)
 
 	curTerm := rf.currentTerm
 	lastLogIndex := len(rf.logs) - 1
@@ -681,7 +712,7 @@ recvLoop:
 		case reply := <-replyCh:
 			if curTerm < reply.Term {
 				rf.mu.Lock()
-				rf.enterNewTerm(reply.Term, rFollower)
+				rf.enterNewTermAsFollower(reply.Term)
 				rf.mu.Unlock()
 				return false
 			}
@@ -772,12 +803,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	InitDebug()
 
+	rf.currentTerm = 1
 	if me == 0 {
 		// make peer 0 the initial leader
-		rf.enterNewTerm(1, rLeader)
 		rf.votedFor = me
+		rf.setRole(rLeader)
 	} else {
-		rf.enterNewTerm(1, rFollower)
+		rf.votedFor = -1
+		rf.setRole(rFollower)
 	}
 
 	// add a dummy entry in the front of logs
