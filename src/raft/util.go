@@ -3,8 +3,11 @@ package raft
 import (
 	"fmt"
 	"log"
+	"net/http"
+	"net/http/pprof"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -13,6 +16,8 @@ const Debug = false
 
 var debugStart time.Time
 var debugVerbosity int
+var mutex sync.Mutex
+var initialized bool = false
 
 type logTopic string
 
@@ -49,11 +54,31 @@ func getVerbosity() int {
 	return level
 }
 
-func InitDebug() {
-	debugVerbosity = getVerbosity()
-	debugStart = time.Now()
+const (
+	pprofAddr string = ":7890"
+)
 
-	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
+func startHTTPDebugger() {
+	pprofHandler := http.NewServeMux()
+	pprofHandler.Handle("/debug/pprof/", http.HandlerFunc(pprof.Index))
+	server := &http.Server{Addr: pprofAddr, Handler: pprofHandler}
+	go server.ListenAndServe()
+}
+
+func InitDebug() {
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	if !initialized {
+		debugVerbosity = getVerbosity()
+		debugStart = time.Now()
+
+		log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
+
+		startHTTPDebugger()
+
+		initialized = true
+	}
 }
 
 func DPrint(topic logTopic, format string, a ...interface{}) {
