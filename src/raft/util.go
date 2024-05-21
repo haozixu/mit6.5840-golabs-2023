@@ -16,8 +16,7 @@ const Debug = false
 
 var debugStart time.Time
 var debugVerbosity int
-var mutex sync.Mutex
-var initialized bool = false
+var once sync.Once
 
 type logTopic string
 
@@ -66,19 +65,14 @@ func startHTTPDebugger() {
 }
 
 func InitDebug() {
-	mutex.Lock()
-	defer mutex.Unlock()
-
-	if !initialized {
+	once.Do(func() {
 		debugVerbosity = getVerbosity()
 		debugStart = time.Now()
 
 		log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
 
 		startHTTPDebugger()
-
-		initialized = true
-	}
+	})
 }
 
 func DPrint(topic logTopic, format string, a ...interface{}) {

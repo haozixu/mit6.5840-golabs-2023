@@ -148,7 +148,10 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 	applyCh   chan ApplyMsg
-	notifyCh  chan bool
+
+	// communicate between RPC handler & applier loop
+	notifyCh chan bool
+	snapMsg  *ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -166,7 +169,7 @@ type Raft struct {
 	commitIndex int // index of highest log entry known to be committed
 	lastApplied int // index of highest log entry applied to state machine
 
-	// NOTE: these variables use independent locks, which may be unnecessary
+	// NOTE: consider removing heartbeatLock
 	role          serverRole
 	lastHeartbeat time.Time
 	heartbeatLock sync.Mutex
@@ -183,12 +186,10 @@ func (rf *Raft) dbg(topic logTopic, format string, a ...interface{}) {
 	DPrint(topic, prefix+format, a...)
 }
 
-func (rf *Raft) getRole() serverRole {
-	return serverRole(atomic.LoadInt32((*int32)(&rf.role)))
-}
-
-func (rf *Raft) setRole(newRole serverRole) {
-	atomic.StoreInt32((*int32)(&rf.role), int32(newRole))
+func (rf *Raft) getRoleLocked() serverRole {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.role
 }
 
 func (rf *Raft) getLastHeartbeat() time.Time {
@@ -210,7 +211,7 @@ func (rf *Raft) enterNewTerm(newTerm int, votedFor int, role serverRole) {
 	rf.votedFor = votedFor
 	rf.persist()
 
-	rf.setRole(role)
+	rf.role = role
 }
 
 func (rf *Raft) enterNewTermAsFollower(newTerm int) {
@@ -227,20 +228,25 @@ func (rf *Raft) notifyNewCommit() {
 	}
 }
 
-func (rf *Raft) commitNewLogs() {
+func (rf *Raft) applyNewLogsOrSnapshot() {
 	var msgs []ApplyMsg
 
 	rf.mu.Lock()
-	rf.dbg(dCommit, "committing index range [%d, %d]", rf.lastApplied+1, rf.commitIndex)
-	for rf.lastApplied < rf.commitIndex {
-		i := rf.lastApplied + 1
-		msg := ApplyMsg{
-			CommandValid: true,
-			Command:      rf.logs.at(i).Command,
-			CommandIndex: i,
+	if rf.snapMsg != nil {
+		msgs = append(msgs, *rf.snapMsg)
+		rf.snapMsg = nil
+	} else {
+		rf.dbg(dCommit, "committing index range [%d, %d]", rf.lastApplied+1, rf.commitIndex)
+		for rf.lastApplied < rf.commitIndex {
+			i := rf.lastApplied + 1
+			msg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.logs.at(i).Command,
+				CommandIndex: i,
+			}
+			msgs = append(msgs, msg)
+			rf.lastApplied = i
 		}
-		msgs = append(msgs, msg)
-		rf.lastApplied = i
 	}
 	rf.mu.Unlock()
 
@@ -253,9 +259,6 @@ func (rf *Raft) commitNewLogs() {
 }
 
 func (rf *Raft) initLeaderState() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	for i := range rf.peers {
 		rf.nextIndex[i] = rf.logs.len() // leader's last log index + 1
 		rf.matchIndex[i] = 0            // no known log entry replicated
@@ -271,7 +274,7 @@ func (rf *Raft) GetState() (int, bool) {
 	defer rf.mu.Unlock()
 
 	term := rf.currentTerm
-	isLeader := (rf.getRole() == rLeader)
+	isLeader := (rf.role == rLeader)
 	return term, isLeader
 }
 
@@ -343,7 +346,7 @@ func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 		}
 
 		// override current role
-		rf.setRole(rFollower)
+		rf.role = rFollower
 	}
 }
 
@@ -359,6 +362,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	lastTerm := rf.logs.termAt(index)
 	newSnapshotLen := index + 1
 	offset := newSnapshotLen - rf.logs.snapshotLen
+
+	// NOTE: prevent snapshot from going back. this MAY happen sometimes
+	if offset <= 0 {
+		return
+	}
 
 	rf.dbg(dSnap, "making snapshot len: %d -> %d", rf.logs.snapshotLen, newSnapshotLen)
 
@@ -482,6 +490,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// reply false if previous logs do not match
 	if !(args.PrevLogIndex < rf.logs.len()) ||
 		(rf.logs.termAt(args.PrevLogIndex) != args.PrevLogTerm && !rf.logs.isTrimmed(args.PrevLogIndex)) {
+
+		t := -1
+		if args.PrevLogIndex < rf.logs.len() {
+			t = rf.logs.termAt(args.PrevLogIndex)
+		}
+
+		rf.dbg(dLog1, "reject log: self last idx=%d, term at prev idx=%d; recv prev idx=%d, prev term=%d",
+			rf.logs.lastIndex(), t, args.PrevLogIndex, args.PrevLogTerm)
+
 		reply.Success = false
 		return
 	}
@@ -502,6 +519,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if hasConflict {
 		rf.logs.truncateTo(selfLogIndex)
+		rf.dbg(dLog1, "truncate logs to length %d", rf.logs.len())
 	}
 
 	// append new entries not already in the log
@@ -513,6 +531,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.logs.append(newEntries...)
 	if hasConflict || len(newEntries) > 0 {
 		rf.persist()
+
+		rf.dbg(dLog2, "log update: leader %d, term %d, leader commit %d, prev log term %d, prev log index %d",
+			args.LeaderId, args.Term, args.LeaderCommit, args.PrevLogTerm, args.PrevLogIndex)
+	}
+
+	if len(newEntries) > 0 {
+		newLen := rf.logs.len()
+		oldLen := newLen - len(newEntries)
+		rf.dbg(dLog1, "extend log length from %d to %d", oldLen, newLen)
 	}
 
 	// stupid min/max. go 1.21 provides them
@@ -558,11 +585,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	// don't update if the snapshot is stale
 	if args.LastIncludedIndex < rf.logs.snapshotLen {
-		rf.dbg(dWarn, "no install current snapshot len: %d recv index: %d", rf.logs.snapshotLen, args.LastIncludedIndex)
+		rf.dbg(dWarn, "no install current snapshot len: %d recv index: %d leader: %d", rf.logs.snapshotLen, args.LastIncludedIndex, args.LeaderId)
 		return
 	}
 
-	rf.dbg(dWarn, "accept snapshot %d", args.LastIncludedIndex)
+	rf.dbg(dSnap, "accept snapshot from S%d, last index %d", args.LeaderId, args.LastIncludedIndex)
 
 	rf.logs.lastLogs = []LogEntry{}
 	rf.logs.snapshotLen = args.LastIncludedIndex + 1
@@ -574,14 +601,13 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.lastApplied = args.LastIncludedIndex
 	rf.commitIndex = args.LastIncludedIndex
 
-	// hope this won't cause deadlock
-	msg := ApplyMsg{
+	rf.snapMsg = &ApplyMsg{
 		SnapshotValid: true,
 		SnapshotIndex: args.LastIncludedIndex,
 		SnapshotTerm:  args.LastIncludedTerm,
 		Snapshot:      args.Snapshot,
 	}
-	rf.applyCh <- msg
+	rf.notifyNewCommit()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -648,14 +674,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	}
 
-	isLeader = (rf.getRole() == rLeader)
-	// not the leader, returns directly
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	isLeader = (rf.role == rLeader)
 	if !isLeader {
 		return index, term, isLeader
 	}
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	index = rf.logs.len()
 	term = rf.currentTerm
@@ -676,6 +701,11 @@ func (rf *Raft) replicateLogs() {
 
 // requires to be invoked when lock is obtained
 func (rf *Raft) makeAppendEntriesBundle(peer int) AppendEntriesBundle {
+	// reset nextIndex if its corresponding entry is already trimmed
+	if rf.logs.isTrimmed(rf.nextIndex[peer]) {
+		rf.nextIndex[peer] = rf.logs.len()
+	}
+
 	nextIndex := rf.nextIndex[peer]
 	prevLogIndex := nextIndex - 1
 
@@ -730,6 +760,11 @@ func (rf *Raft) broadcastAppendEntries(isHeartbeat bool) {
 
 	nTargets := 0
 	rf.mu.Lock() // enter critical section
+	// double check current role
+	if rf.role != rLeader {
+		rf.mu.Unlock()
+		return
+	}
 	// send AppendEntries RPC concurrently
 	for i := range rf.peers {
 		if i == rf.me {
@@ -744,77 +779,85 @@ func (rf *Raft) broadcastAppendEntries(isHeartbeat bool) {
 
 		nTargets++
 
-		// reset nextIndex if its corresponding entry is already trimmed
-		if rf.logs.isTrimmed(rf.nextIndex[i]) {
-			rf.nextIndex[i] = rf.logs.len()
-		}
 		b := rf.makeAppendEntriesBundle(i)
 		go doAppendEntriesRpc(b)
 	}
 	rf.mu.Unlock() // leave critical section
 
-	rpcTimeout := 50 * time.Millisecond
+	rpcTimeout := 40 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 	defer cancel()
 
 	nRecv := 0
 	snapshotInstalledFor := make(map[int]bool)
+
+	handleReply := func(b AppendEntriesBundle) string {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+
+		if rf.role != rLeader {
+			return "abort"
+		}
+
+		replyTerm := b.reply.Term
+
+		if rf.currentTerm < replyTerm {
+			// step down immediately
+			rf.enterNewTermAsFollower(replyTerm)
+			return "abort"
+		}
+
+		if rf.currentTerm > replyTerm {
+			// outdated RPC, ignore the reply
+			return "continue"
+		}
+
+		// failed due to log inconsistency
+		i := b.peer
+		if !b.reply.Success {
+			// skip logs that have the same term with the rejected entry
+			prevIndex := b.args.PrevLogIndex
+			for prevIndex > 0 && !rf.logs.isTrimmed(prevIndex) &&
+				rf.logs.termAt(prevIndex) == b.args.PrevLogTerm {
+				prevIndex--
+			}
+
+			_, installed := snapshotInstalledFor[i]
+			if !installed && rf.logs.isTrimmed(prevIndex) {
+				rf.nextIndex[i] = rf.logs.snapshotLen
+
+				bn := rf.makeInstallSnapshotBundle(i)
+				go doInstallSnapshotRpc(bn)
+			} else {
+				rf.nextIndex[i] = prevIndex + 1
+
+				bn := rf.makeAppendEntriesBundle(i)
+				go doAppendEntriesRpc(bn)
+			}
+			return "continue"
+		}
+
+		// NOTE: rf.logs may be already updated, use info from args instead
+		// NOTE: and replies may arrive out of order
+		newMatchIndex := b.args.PrevLogIndex + len(b.args.Entries)
+		if rf.matchIndex[i] < newMatchIndex {
+			rf.matchIndex[i] = newMatchIndex
+			rf.nextIndex[i] = newMatchIndex + 1
+		}
+		return "ok"
+	}
+
 recvLoop:
 	for {
 		select {
 		case b := <-aeRespCh:
-			if rf.getRole() != rLeader {
+			action := handleReply(b)
+			switch action {
+			case "abort":
 				return
-			}
-
-			rf.mu.Lock() // enter critical section
-			if b.args.Term < rf.currentTerm {
-				// NOTE: this CAN happen. ignore the reply
-				rf.mu.Unlock() // leave critical section
+			case "continue":
 				continue recvLoop
 			}
-
-			if rf.currentTerm < b.reply.Term {
-				// step down immediately
-				rf.enterNewTermAsFollower(b.reply.Term)
-				rf.mu.Unlock() // leave critical section
-				return
-			}
-
-			// failed due to log inconsistency
-			i := b.peer
-			if !b.reply.Success {
-				// skip logs that have the same term with the rejected entry
-				prevIndex := b.args.PrevLogIndex
-				for prevIndex > 0 && !rf.logs.isTrimmed(prevIndex) &&
-					rf.logs.termAt(prevIndex) == b.args.PrevLogTerm {
-					prevIndex--
-				}
-
-				_, installed := snapshotInstalledFor[i]
-				if !installed && rf.logs.isTrimmed(prevIndex) {
-					rf.nextIndex[i] = rf.logs.len()
-
-					bn := rf.makeInstallSnapshotBundle(i)
-					go doInstallSnapshotRpc(bn)
-				} else {
-					rf.nextIndex[i] = prevIndex + 1
-
-					bn := rf.makeAppendEntriesBundle(i)
-					go doAppendEntriesRpc(bn)
-				}
-				rf.mu.Unlock() // leave critical section
-				continue recvLoop
-			}
-
-			// NOTE: rf.logs may be already updated, use info from args instead
-			// NOTE: and replies may arrive out of order
-			newMatchIndex := b.args.PrevLogIndex + len(b.args.Entries)
-			if rf.matchIndex[i] < newMatchIndex {
-				rf.matchIndex[i] = newMatchIndex
-				rf.nextIndex[i] = newMatchIndex + 1
-			}
-			rf.mu.Unlock() // leave critical section
 
 			nRecv++
 			if nRecv >= nTargets {
@@ -837,12 +880,12 @@ recvLoop:
 }
 
 func (rf *Raft) leaderTryCommit() {
-	if rf.getRole() != rLeader { // guard
-		return
-	}
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	if rf.role != rLeader { // guard
+		return
+	}
 
 	// check if we can commit new logs
 	newIndex := rf.logs.lastIndex()
@@ -925,7 +968,7 @@ func (rf *Raft) startElection() bool {
 	votes := 1
 	nRecv := 0
 
-	rpcTimeout := 50 * time.Millisecond
+	rpcTimeout := 40 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 	defer cancel()
 
@@ -933,6 +976,15 @@ recvLoop:
 	for {
 		select {
 		case reply := <-replyCh:
+			if rf.getRoleLocked() != rCandidate {
+				return false
+			}
+
+			// outdated RPC, ignore
+			if curTerm > reply.Term {
+				continue recvLoop
+			}
+
 			if curTerm < reply.Term {
 				rf.mu.Lock()
 				rf.enterNewTermAsFollower(reply.Term)
@@ -950,11 +1002,11 @@ recvLoop:
 		case <-ctx.Done():
 			break recvLoop
 		}
+	}
 
-		// if current role is no longer candidate, exit
-		if rf.getRole() != rCandidate {
-			return false
-		}
+	// if current role is no longer candidate, exit
+	if rf.getRoleLocked() != rCandidate {
+		return false
 	}
 
 	rf.dbg(dInfo, "got %d votes", votes)
@@ -962,7 +1014,7 @@ recvLoop:
 }
 
 func (rf *Raft) electionTicker() {
-	electionTimeout := 400 * time.Millisecond
+	electionTimeout := 250 * time.Millisecond
 
 	rf.updateHeartbeat()
 	for !rf.killed() {
@@ -971,36 +1023,37 @@ func (rf *Raft) electionTicker() {
 		// Check if a leader election should be started.
 
 		// condition: election timeout & is follower or candidate
-		if rf.getRole() != rLeader && time.Since(rf.getLastHeartbeat()) > electionTimeout {
+		if rf.getRoleLocked() != rLeader && time.Since(rf.getLastHeartbeat()) > electionTimeout {
 			rf.dbg(dTimer, "election timeout, start election")
 
 			if win := rf.startElection(); win {
-				rf.setRole(rLeader)
+				rf.mu.Lock()
 				rf.dbg(dLeader, "is now leader!")
-
+				rf.role = rLeader
 				rf.initLeaderState()
+				rf.mu.Unlock()
 
 				// send heartbeats immediately
 				rf.broadcastAppendEntries(true)
 			} else {
-				rf.dbg(dInfo, "election failed, still %s", rf.getRole().String())
+				rf.dbg(dInfo, "election failed, still %s", rf.getRoleLocked().String())
 			}
 		}
 
-		// pause for a random amount of time between 50 and 350
+		// pause for a random amount of time between 50 and 250
 		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
+		ms := 50 + (rand.Int63() % 200)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
 func (rf *Raft) heartbeatTicker() {
-	heartbeatInterval := 125 * time.Millisecond
+	heartbeatInterval := 80 * time.Millisecond
 
 	for !rf.killed() {
 		time.Sleep(heartbeatInterval)
 
-		if rf.getRole() == rLeader {
+		if rf.getRoleLocked() == rLeader {
 			rf.broadcastAppendEntries(true)
 		}
 	}
@@ -1010,7 +1063,7 @@ func (rf *Raft) applierLoop() {
 	for !rf.killed() {
 		<-rf.notifyCh
 
-		rf.commitNewLogs()
+		rf.applyNewLogsOrSnapshot()
 	}
 }
 
@@ -1031,18 +1084,22 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.applyCh = applyCh
 	rf.notifyCh = make(chan bool, 1)
+	rf.snapMsg = nil
 
 	// Your initialization code here (2A, 2B, 2C).
 	InitDebug()
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	rf.currentTerm = 1
 	if me == 0 {
 		// make peer 0 the initial leader
 		rf.votedFor = me
-		rf.setRole(rLeader)
+		rf.role = rLeader
 	} else {
 		rf.votedFor = -1
-		rf.setRole(rFollower)
+		rf.role = rFollower
 	}
 
 	// add a dummy entry in the front of logs
