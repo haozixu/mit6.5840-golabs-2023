@@ -75,8 +75,7 @@ func (ck *Clerk) Get(key string) string {
 	defer ck.mtx.Unlock()
 
 	seqNo := ck.newSeqNo()
-
-	// log.Printf("clerk::Get key=%s, client=%v, #seq=%d, begin", key, ck.clientId, seqNo)
+	// log.Printf("clerk::Get key=%s, client=%v, #seq=%d", key, ck.clientId, seqNo)
 
 	for {
 		serverIds := ck.makeServerOrder()
@@ -101,7 +100,6 @@ func (ck *Clerk) Get(key string) string {
 				// log.Printf("clerk::Get key=%s, client=%v, #seq=%d, retval=%s", key, ck.clientId, seqNo, vvv)
 				return reply.Value
 			}
-			panic("todo")
 		}
 
 		time.Sleep(10 * time.Millisecond)
@@ -123,6 +121,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	defer ck.mtx.Unlock()
 
 	seqNo := ck.newSeqNo()
+	// log.Printf("clerk::PutAppend op=%s, key=%s, value=%s, client=%v, #seq=%d", op, key, value, ck.clientId, seqNo)
 
 	for {
 		serverIds := ck.makeServerOrder()
@@ -141,7 +140,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				ck.curLeader = serverId
 				return
 			}
-			panic("todo")
 		}
 
 		time.Sleep(10 * time.Millisecond)

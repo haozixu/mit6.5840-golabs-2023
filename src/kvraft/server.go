@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"context"
 	"log"
 	"sync"
@@ -33,8 +34,8 @@ type Op struct {
 }
 
 type RecentResult struct {
-	seqNo int
-	value string
+	SeqNo int
+	Value string
 }
 
 type DuplicateTable struct {
@@ -59,10 +60,16 @@ type KVServer struct {
 	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
+	persister    *raft.Persister
 
 	// Your definitions here.
-	state     map[string]string
-	opResults DuplicateTable
+
+	// states that should be persisted in snapshot
+	state            map[string]string
+	opResults        DuplicateTable
+	lastAppliedIndex int
+
+	// temporary variables
 	resultChs map[ReqId]chan ExecutionResult
 }
 
@@ -70,10 +77,19 @@ func makeDuplicateTable() DuplicateTable {
 	return DuplicateTable{make(map[int64]RecentResult)}
 }
 
+func valueDigest(s string) string {
+	m := 12
+	l := len(s)
+	if l > m {
+		return "..." + s[l-m:]
+	}
+	return s
+}
+
 func (dt *DuplicateTable) getClientResult(clientId int64) RecentResult {
 	res, exist := dt.inner[clientId]
 	if !exist {
-		res = RecentResult{seqNo: 0}
+		res = RecentResult{SeqNo: 0}
 		dt.inner[clientId] = res
 	}
 	return res
@@ -83,7 +99,7 @@ func (dt *DuplicateTable) trimOutdated(clientId int64, seqNo int) {
 	// do nothing. but panic if sequence number violate our assumption
 	recent := dt.getClientResult(clientId)
 
-	if seqNo < recent.seqNo {
+	if seqNo < recent.SeqNo {
 		panic("sequence out of order")
 	}
 }
@@ -91,11 +107,14 @@ func (dt *DuplicateTable) trimOutdated(clientId int64, seqNo int) {
 func (dt *DuplicateTable) query(clientId int64, seqNo int) (string, bool) {
 	recent := dt.getClientResult(clientId)
 
-	if seqNo > recent.seqNo {
+	if seqNo > recent.SeqNo {
 		return "", false
-	} else if seqNo == recent.seqNo {
-		return recent.value, true
+	} else if seqNo == recent.SeqNo {
+		return recent.Value, true
 	} else {
+		log.Printf("$ dupTable query client=%v seq=%d; but recent seq=%d, value=%s",
+			clientId, seqNo, recent.SeqNo, valueDigest(recent.Value))
+		// NOTE: this could happen if two clients have the same id
 		panic("sequence out of order")
 	}
 }
@@ -176,7 +195,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	reply.Err = OK
 	reply.Value = result
 
-	// log.Printf("kvs final return Get: val=%v client=%v seq=%d", result, clientId, seqNo)
+	// log.Printf("kvs S%d return Get: val=%v client=%v seq=%d", kv.me, valueDigest(result), clientId, seqNo)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -260,21 +279,21 @@ func (kv *KVServer) executorLoop() {
 			op := msg.Command.(Op)
 			clientId, seqNo := op.ClientId, op.SeqNo
 
-			if clientId == 0 && seqNo == 0 {
-				log.Printf("bad op: %v", op)
-				panic("bad op")
+			if msg.CommandIndex < kv.lastAppliedIndex {
+				panic("apply index out of order")
 			}
+			kv.lastAppliedIndex = msg.CommandIndex
 
 			// guard against re-execution
 			var result string
 			recentResult := kv.opResults.getClientResult(clientId)
-			if seqNo > recentResult.seqNo {
+			if seqNo > recentResult.SeqNo {
 				result = kv.executeOp(&op)
 				kv.opResults.update(clientId, seqNo, result)
 
-				// log.Printf("@ S%d EXECUTE client=%v seq=%d op=%s key=%s result=%s", kv.me, op.ClientId, op.SeqNo, op.Type, op.Key, result)
-			} else if seqNo == recentResult.seqNo {
-				result = recentResult.value
+				// log.Printf("S%d EXECUTE client=%v seq=%d op=%s key=%s val=%s result=%s", kv.me, op.ClientId, op.SeqNo, op.Type, op.Key, op.Value, valueDigest(result))
+			} else if seqNo == recentResult.SeqNo {
+				result = recentResult.Value
 			} else {
 				panic("???")
 			}
@@ -292,10 +311,45 @@ func (kv *KVServer) executorLoop() {
 				}
 				close(ch)
 			}
+
+			if kv.maxraftstate > 0 && kv.persister.RaftStateSize() > kv.maxraftstate {
+				kv.rf.Snapshot(msg.CommandIndex, kv.makeSnapshot())
+			}
+		} else if msg.SnapshotValid {
+			if msg.SnapshotIndex > kv.lastAppliedIndex {
+				kv.applySnapshot(msg.Snapshot)
+			}
 		} else {
 			panic("todo")
 		}
 		kv.mu.Unlock()
+	}
+}
+
+func (kv *KVServer) dumpState() {
+	for k, v := range kv.state {
+		log.Printf("# kvState: key=%s; value=%s", k, valueDigest(v))
+	}
+	for cl, rr := range kv.opResults.inner {
+		log.Printf("# dupTable: client=%v, seq=%d, value=%s", cl, rr.SeqNo, valueDigest(rr.Value))
+	}
+}
+
+func (kv *KVServer) makeSnapshot() []byte {
+	buf := new(bytes.Buffer)
+	e := labgob.NewEncoder(buf)
+	e.Encode(kv.state)
+	e.Encode(kv.opResults.inner)
+	e.Encode(kv.lastAppliedIndex)
+	return buf.Bytes()
+}
+
+func (kv *KVServer) applySnapshot(snapshot []byte) {
+	d := labgob.NewDecoder(bytes.NewBuffer(snapshot))
+	if d.Decode(&kv.state) != nil ||
+		d.Decode(&kv.opResults.inner) != nil ||
+		d.Decode(&kv.lastAppliedIndex) != nil {
+		panic("bad snapshot")
 	}
 }
 
@@ -338,11 +392,20 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.persister = persister
 
 	// You may need initialization code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 
-	kv.state = make(map[string]string)
-	kv.opResults = makeDuplicateTable()
+	// TODO: restore snapshot directly or wait for raft to issue a snapshot message?
+	if snapshot := persister.ReadSnapshot(); len(snapshot) > 0 {
+		kv.applySnapshot(snapshot)
+	} else {
+		kv.state = make(map[string]string)
+		kv.opResults = makeDuplicateTable()
+		kv.lastAppliedIndex = 0
+	}
 	kv.resultChs = make(map[ReqId]chan ExecutionResult)
 
 	kv.applyCh = make(chan raft.ApplyMsg)

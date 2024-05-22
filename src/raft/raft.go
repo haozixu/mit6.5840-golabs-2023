@@ -228,6 +228,18 @@ func (rf *Raft) notifyNewCommit() {
 	}
 }
 
+// this helper does not update application snapshot immediately.
+// instead, it prepares a snapshot message and notifies applier loop to apply the message
+func (rf *Raft) updateSnapshot() {
+	rf.snapMsg = &ApplyMsg{
+		SnapshotValid: true,
+		SnapshotIndex: rf.logs.snapshotLen - 1,
+		SnapshotTerm:  rf.logs.lastTermInShapshot,
+		Snapshot:      rf.logs.snapshot,
+	}
+	rf.notifyNewCommit()
+}
+
 func (rf *Raft) applyNewLogsOrSnapshot() {
 	var msgs []ApplyMsg
 
@@ -347,6 +359,11 @@ func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 
 		// override current role
 		rf.role = rFollower
+
+		// NOTE: this can be redundant if the application handles snapshot when it starts
+		// if len(snapshot) > 0 {
+		// 	rf.updateSnapshot()
+		// }
 	}
 }
 
@@ -591,23 +608,30 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	rf.dbg(dSnap, "accept snapshot from S%d, last index %d", args.LeaderId, args.LastIncludedIndex)
 
-	rf.logs.lastLogs = []LogEntry{}
-	rf.logs.snapshotLen = args.LastIncludedIndex + 1
+	newSnapshotLen := args.LastIncludedIndex + 1
+	offset := newSnapshotLen - rf.logs.snapshotLen
+	if offset < len(rf.logs.lastLogs) {
+		rf.logs.lastLogs = rf.logs.lastLogs[offset:]
+	} else {
+		rf.logs.lastLogs = []LogEntry{}
+	}
+	rf.logs.snapshotLen = newSnapshotLen
 	rf.logs.lastTermInShapshot = args.LastIncludedTerm
 	rf.logs.snapshot = args.Snapshot
 
 	rf.persist()
 
-	rf.lastApplied = args.LastIncludedIndex
-	rf.commitIndex = args.LastIncludedIndex
-
-	rf.snapMsg = &ApplyMsg{
-		SnapshotValid: true,
-		SnapshotIndex: args.LastIncludedIndex,
-		SnapshotTerm:  args.LastIncludedTerm,
-		Snapshot:      args.Snapshot,
+	maxInt := func(a int, b int) int {
+		if a > b {
+			return a
+		}
+		return b
 	}
-	rf.notifyNewCommit()
+
+	rf.lastApplied = maxInt(rf.lastApplied, args.LastIncludedIndex)
+	rf.commitIndex = maxInt(rf.commitIndex, args.LastIncludedIndex)
+
+	rf.updateSnapshot()
 }
 
 // example code to send a RequestVote RPC to a server.
