@@ -14,13 +14,27 @@ const (
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongGroup  = "ErrWrongGroup"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrNotReady    = "ErrNotReady"
+	ErrTimeout     = "ErrTimeout"
+	ErrReject      = "ErrReject"
 )
 
 type Err string
 
+type RequestId struct {
+	ClientId int64
+	SeqNo    int
+}
+
+type ExecutionResult struct {
+	Id    RequestId
+	Value string
+}
+
 // Put or Append
 type PutAppendArgs struct {
 	// You'll have to add definitions here.
+	ReqId RequestId
 	Key   string
 	Value string
 	Op    string // "Put" or "Append"
@@ -34,7 +48,8 @@ type PutAppendReply struct {
 }
 
 type GetArgs struct {
-	Key string
+	ReqId RequestId
+	Key   string
 	// You'll have to add definitions here.
 }
 

@@ -28,46 +28,67 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func CopyConfig(src *Config) *Config {
+	newGroups := make(map[int][]string)
+	for k, v := range src.Groups {
+		newGroups[k] = v
+	}
+
+	return &Config{
+		Num:    src.Num,
+		Shards: src.Shards,
+		Groups: newGroups,
+	}
+}
+
 const (
-	OK = "OK"
+	OK             = "OK"
+	ErrRetry       = "ErrRetry"
+	ErrTimeout     = "ErrTimeout"
+	ErrWrongLeader = "ErrWrongLeader"
 )
 
 type Err string
 
+type RequestId struct {
+	ClientId int64
+	SeqNo    int
+}
+
 type JoinArgs struct {
+	ReqId   RequestId
 	Servers map[int][]string // new GID -> servers mappings
 }
 
 type JoinReply struct {
-	WrongLeader bool
-	Err         Err
+	Err Err
 }
 
 type LeaveArgs struct {
-	GIDs []int
+	ReqId RequestId
+	GIDs  []int
 }
 
 type LeaveReply struct {
-	WrongLeader bool
-	Err         Err
+	Err Err
 }
 
 type MoveArgs struct {
+	ReqId RequestId
 	Shard int
 	GID   int
 }
 
 type MoveReply struct {
-	WrongLeader bool
-	Err         Err
+	Err Err
 }
 
 type QueryArgs struct {
-	Num int // desired config number
+	ReqId RequestId
+	Num   int // desired config number
 }
 
 type QueryReply struct {
-	WrongLeader bool
-	Err         Err
-	Config      Config
+	Err    Err
+	Config Config
 }

@@ -74,13 +74,12 @@ func (ck *Clerk) Get(key string) string {
 	ck.mtx.Lock()
 	defer ck.mtx.Unlock()
 
-	seqNo := ck.newSeqNo()
-	// log.Printf("clerk::Get key=%s, client=%v, #seq=%d", key, ck.clientId, seqNo)
+	args := GetArgs{Key: key, ClientId: ck.clientId, SeqNo: ck.newSeqNo()}
+	// log.Printf("clerk::Get args=%v", args)
 
 	for {
 		serverIds := ck.makeServerOrder()
 		for _, serverId := range serverIds {
-			args := GetArgs{Key: key, ClientId: ck.clientId, SeqNo: seqNo}
 			reply := GetReply{}
 
 			// TODO: handle timeout
@@ -120,13 +119,12 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	ck.mtx.Lock()
 	defer ck.mtx.Unlock()
 
-	seqNo := ck.newSeqNo()
-	// log.Printf("clerk::PutAppend op=%s, key=%s, value=%s, client=%v, #seq=%d", op, key, value, ck.clientId, seqNo)
+	args := PutAppendArgs{Key: key, Value: value, Op: op, ClientId: ck.clientId, SeqNo: ck.newSeqNo()}
+	// log.Printf("clerk::PutAppend args=%v", args)
 
 	for {
 		serverIds := ck.makeServerOrder()
 		for _, serverId := range serverIds {
-			args := PutAppendArgs{Key: key, Value: value, Op: op, ClientId: ck.clientId, SeqNo: seqNo}
 			reply := PutAppendReply{}
 
 			// TODO: handle timeout

@@ -153,48 +153,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		Type:     "Get",
 		Key:      args.Key,
 	}
-
-	_, _, isLeader := kv.rf.Start(op)
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		return
-	}
-
-	resultCh := make(chan ExecutionResult)
-	reqId := ReqId{clientId, seqNo}
-
-	kv.mu.Lock()
-	kv.resultChs[reqId] = resultCh
-	kv.mu.Unlock()
-
-	timeout := 1 * time.Second
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	select {
-	case execResult := <-resultCh:
-		// FIXME: sometimes bad value come out of channel
-		if execResult.id != reqId {
-			reply.Err = ErrRetry
-			return
-		}
-		result = execResult.value
-	case <-ctx.Done():
-		// log.Printf("KVServer: Get timeout!\n")
-		reply.Err = ErrTimeout
-		return
-	}
-
-	// TODO: do we need to check index (prev == current) ?
-	_, isLeaderNow := kv.rf.GetState()
-	if !isLeaderNow {
-		reply.Err = ErrWrongLeader
-		return
-	}
-
-	reply.Err = OK
-	reply.Value = result
-
+	kv.commonHandler(&op, reply)
 	// log.Printf("kvs S%d return Get: val=%v client=%v seq=%d", kv.me, valueDigest(result), clientId, seqNo)
 }
 
@@ -215,15 +174,20 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Key:      args.Key,
 		Value:    args.Value,
 	}
+	internalReply := GetReply{}
+	kv.commonHandler(&op, &internalReply)
+	reply.Err = internalReply.Err
+}
 
-	_, _, isLeader := kv.rf.Start(op)
+func (kv *KVServer) commonHandler(op *Op, reply *GetReply) {
+	_, _, isLeader := kv.rf.Start(*op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
 
 	resultCh := make(chan ExecutionResult)
-	reqId := ReqId{clientId, seqNo}
+	reqId := ReqId{op.ClientId, op.SeqNo}
 
 	kv.mu.Lock()
 	kv.resultChs[reqId] = resultCh
@@ -240,19 +204,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			reply.Err = ErrRetry
 			return
 		}
+		reply.Value = execResult.value
 	case <-ctx.Done():
-		// log.Printf("KVServer: PutAppend timeout!\n")
+		// log.Printf("KVServer: handler timeout!\n")
 		reply.Err = ErrTimeout
 		return
 	}
-
-	// TODO: do we need to check index (prev == current) ?
-	_, isLeaderNow := kv.rf.GetState()
-	if !isLeaderNow {
-		reply.Err = ErrWrongLeader
-		return
-	}
-
 	reply.Err = OK
 }
 
